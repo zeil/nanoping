@@ -22,10 +22,12 @@ enum nanoping_mode {
 
 static struct option longopts[] = {
     {"interface", required_argument, NULL, 'i'},
+    {"address", required_argument,  NULL,  'a'},
     {"count",   required_argument,  NULL,  'n'},
     {"delay",   required_argument,  NULL,  'd'},
     {"port",    required_argument,  NULL,  'p'},
     {"log",     required_argument,  NULL,   'l'},
+    {"ipv6",    no_argument,        NULL,   '6'},
     {"emulation",   no_argument,    NULL,   'e'},
     {"ptpmode", no_argument,        NULL,   'P'},
     {"silent",  no_argument,        NULL,   's'},
@@ -45,8 +47,8 @@ static pthread_t signal_thread = 0;
 static void usage(void)
 {
     fprintf(stderr, "usage:\n");
-    fprintf(stderr, "  client: nanoping --client --interface [nic] --count [sec] --delay [usec] --port [port] --log [log] --emulation --ptpmode --silent --timeout [usec] --busypoll [usec] --dummy-pkt [cnt] [host]\n");
-    fprintf(stderr, "  server: nanoping --server --interface [nic] --port [port] --emulation --ptpmode --silent --timeout [usec] --busypoll [usec] --dummy-pkt [cnt]\n");
+    fprintf(stderr, "  client: nanoping --client --interface [nic] --address [ip] --count [sec] --delay [usec] --port [port] --log [log] --ipv6 --emulation --ptpmode --silent --timeout [usec] --busypoll [usec] --dummy-pkt [cnt] [host]\n");
+    fprintf(stderr, "  server: nanoping --server --interface [nic] --address [ip] --port [port] --ipv6 --emulation --ptpmode --silent --timeout [usec] --busypoll [usec] --dummy-pkt [cnt]\n");
 }
 
 static struct {
@@ -412,8 +414,8 @@ static int run_client(struct nanoping_instance *ins, int count, int delay, char 
     }
 
     atomic_store(&state, msg_syn);
-    memcpy(&send_request.remaddr, reminfo->ai_addr,
-            sizeof(send_request.remaddr));
+    memcpy(&send_request.remaddr, reminfo->ai_addr, reminfo->ai_addrlen);
+    send_request.remaddr_len = reminfo->ai_addrlen;
     send_request.type = msg_syn;
     send_request.seq = 0;
     for(bool first_time = true;;) {
@@ -434,8 +436,8 @@ static int run_client(struct nanoping_instance *ins, int count, int delay, char 
         return EXIT_FAILURE;
 
     atomic_store(&state, msg_ping);
-    memcpy(&send_request.remaddr, reminfo->ai_addr,
-            sizeof(send_request.remaddr));
+    memcpy(&send_request.remaddr, reminfo->ai_addr, reminfo->ai_addrlen);
+    send_request.remaddr_len = reminfo->ai_addrlen;
     send_request.type = msg_ping;
     for (i = 1; !atomic_load(&signal_handled); i++) {
         send_request.seq = i;
@@ -448,8 +450,8 @@ static int run_client(struct nanoping_instance *ins, int count, int delay, char 
             usleep(delay);
         if (dummy_pkt) {
             struct nanoping_send_dummies_request dummies_request;
-            memcpy(&dummies_request.remaddr, reminfo->ai_addr,
-                sizeof(dummies_request.remaddr));
+            memcpy(&dummies_request.remaddr, reminfo->ai_addr, reminfo->ai_addrlen);
+            dummies_request.remaddr_len = reminfo->ai_addrlen;
             dummies_request.nmsg = dummy_pkt;
 
             res = nanoping_send_dummies(ins, &dummies_request);
@@ -545,6 +547,7 @@ static int run_server(struct nanoping_instance *ins, char *port, int dummy_pkt)
                     atomic_store(&state, msg_pong);
                     send_request.seq = receive_result.seq;
                     send_request.remaddr = receive_result.remaddr;
+                    send_request.remaddr_len = receive_result.remaddr_len;
                     send_request.type = msg_syn_ack;
                     if (nanoping_send_one(ins, &send_request) < 0)
                         return EXIT_FAILURE;
@@ -556,6 +559,7 @@ static int run_server(struct nanoping_instance *ins, char *port, int dummy_pkt)
                 }else{
                     send_request.seq = receive_result.seq;
                     send_request.remaddr = receive_result.remaddr;
+                    send_request.remaddr_len = receive_result.remaddr_len;
                     send_request.type = msg_syn_rst;
                     if (nanoping_send_one(ins, &send_request) < 0)
                         return EXIT_FAILURE;
@@ -565,6 +569,7 @@ static int run_server(struct nanoping_instance *ins, char *port, int dummy_pkt)
             case msg_fin:
                 send_request.seq = receive_result.seq;
                 send_request.remaddr = receive_result.remaddr;
+                send_request.remaddr_len = receive_result.remaddr_len;
                 send_request.type = msg_fin_ack;
                 if (nanoping_send_one(ins, &send_request) < 0)
                     return EXIT_FAILURE;
@@ -600,12 +605,14 @@ static int run_server(struct nanoping_instance *ins, char *port, int dummy_pkt)
 
                 send_request.seq = receive_result.seq;
                 send_request.remaddr = receive_result.remaddr;
+                send_request.remaddr_len = receive_result.remaddr_len;
                 send_request.type = msg_pong;
                 if (nanoping_send_one(ins, &send_request) < 0)
                     return EXIT_FAILURE;
                 if (dummy_pkt) {
                     struct nanoping_send_dummies_request dummies_request;
                     dummies_request.remaddr = receive_result.remaddr;
+                    dummies_request.remaddr_len = receive_result.remaddr_len;
                     dummies_request.nmsg = dummy_pkt;
 
                     res = nanoping_send_dummies(ins, &dummies_request);
@@ -629,11 +636,13 @@ int main(int argc, char **argv)
     struct nanoping_instance *ins = NULL;
     enum nanoping_mode mode = mode_none;
     char *interface = NULL;
+    char *address = NULL;
     int count = 0;
     int delay = 100;
     char *host = NULL;
     char *port = "10666";
     char *log = NULL;
+    int family = AF_INET;
     bool emulation = false;
     bool ptpmode = false;
     bool silent = false;
@@ -657,10 +666,13 @@ int main(int argc, char **argv)
 	usage();
 	return EXIT_FAILURE;
     }
-    while ((c = getopt_long(nargc, argv + 1, "i:n:d:p:l:ePst:b:h", longopts, NULL)) != -1) {
+    while ((c = getopt_long(nargc, argv + 1, "i:a:n:d:p:l:6ePst:b:h", longopts, NULL)) != -1) {
         switch (c) {
             case 'i':
                 interface = optarg;
+                break;
+            case 'a':
+                address = optarg;
                 break;
             case 'n':
                 count = atoi(optarg);
@@ -673,6 +685,9 @@ int main(int argc, char **argv)
                 break;
             case 'l':
                 log = optarg;
+                break;
+            case '6':
+                family = AF_INET6;
                 break;
             case 'e':
                 emulation = true;
@@ -715,7 +730,7 @@ int main(int argc, char **argv)
      }
 
     pthread_mutex_init(&stats.lock, NULL);
-    if ((ins = nanoping_init(interface, port, mode == mode_server ? true: false, emulation, ptpmode, timeout, busy_poll)) == NULL) {
+    if ((ins = nanoping_init(interface, address, port, family, mode == mode_server ? true: false, emulation, ptpmode, timeout, busy_poll)) == NULL) {
         return EXIT_FAILURE;
     }
 

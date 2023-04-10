@@ -9,6 +9,8 @@
 #include <pthread.h>
 #include <assert.h>
 #include <stdarg.h>
+#include <ifaddrs.h>
+#include <netdb.h>
 #include <net/if.h>
 #include <sys/ioctl.h>
 #include <sys/select.h>
@@ -64,24 +66,47 @@ struct nanoping_emul_txs {
     struct timespec stamp;
 } __attribute__((__packed__));
 
-static int get_if_address(int fd, char *ifname, struct in_addr *addr)
+static int get_if_address(int fd, char *ifname, int family, uint16_t port, struct sockaddr_storage *addr)
 {
-    int res;
-    struct ifreq ifr;
-    struct sockaddr_in *sin = (struct sockaddr_in *)&ifr.ifr_addr;
+    struct ifaddrs *ifaddr;
+    int ret = -1;
 
-    memset(&ifr, 0, sizeof(ifr));
-    strncpy(ifr.ifr_name, ifname, IFNAMSIZ);
-    ifr.ifr_addr.sa_family = AF_INET;
-    if ((res = ioctl(fd, SIOCGIFADDR, &ifr)) < 0) {
-        perror("SIOCGIFADDR");
-        return res;
+    if (getifaddrs(&ifaddr) < 0) {
+        perror("getifaddrs");
+        return -1;
     }
-    *addr = sin->sin_addr;
-    return 0;
+
+    for (struct ifaddrs *ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
+        if (ifa->ifa_addr == NULL)
+            continue;
+
+        if (strcmp(ifname, ifa->ifa_name))
+            continue;
+
+        if (ifa->ifa_addr->sa_family != family)
+            continue;
+
+        if (family == AF_INET) {
+            struct sockaddr_in *sa = (struct sockaddr_in *)ifa->ifa_addr;
+            sa->sin_port = port;
+        } else if (family == AF_INET6) {
+            struct sockaddr_in6 *sa6 = (struct sockaddr_in6 *)ifa->ifa_addr;
+            if (IN6_IS_ADDR_LINKLOCAL(&sa6->sin6_addr))
+                continue;
+            sa6->sin6_port = port;
+        }
+
+        memcpy(addr, ifa->ifa_addr, sockaddr_len(family));
+        ret = 0;
+        break;
+    }
+
+    freeifaddrs(ifaddr);
+
+    return ret;
 }
 
-static int enable_hw_timestamp(int fd, char *ifname, bool ptpmode)
+static int enable_hw_timestamp(struct nanoping_instance *ins, char *ifname)
 {
     int res;
     struct hwtstamp_config config = {.flags = 0, .tx_type = HWTSTAMP_TX_ON};
@@ -89,16 +114,15 @@ static int enable_hw_timestamp(int fd, char *ifname, bool ptpmode)
     unsigned int opt;
     int enabled = 1;
 
-    if (!ptpmode) {
+    if (!ins->ptpmode) {
         config.rx_filter = HWTSTAMP_FILTER_ALL;
     } else {
         config.rx_filter = HWTSTAMP_FILTER_PTP_V2_SYNC;
     }
     memset(&ifr, 0, sizeof(ifr));
     strncpy(ifr.ifr_name, ifname, IFNAMSIZ);
-    ifr.ifr_addr.sa_family = AF_INET;
     ifr.ifr_data = (void *)&config;
-    if ((res = ioctl(fd, SIOCSHWTSTAMP, &ifr)) < 0) {
+    if ((res = ioctl(ins->fd, SIOCSHWTSTAMP, &ifr)) < 0) {
         perror("SIOCSHWTSTAMP");
         return res;
     }
@@ -114,34 +138,43 @@ static int enable_hw_timestamp(int fd, char *ifname, bool ptpmode)
         SOF_TIMESTAMPING_TX_HARDWARE |
         SOF_TIMESTAMPING_RAW_HARDWARE |
         SOF_TIMESTAMPING_OPT_CMSG;
-    if ((res = setsockopt(fd, SOL_SOCKET, SO_TIMESTAMPING, (char *)&opt,
+    if ((res = setsockopt(ins->fd, SOL_SOCKET, SO_TIMESTAMPING, (char *)&opt,
                     sizeof(opt))) < 0) {
         perror("SO_TIMESTAMPING");
         return res;
     }
-    if ((res = setsockopt(fd, SOL_SOCKET, SO_SELECT_ERR_QUEUE, &enabled,
+    if ((res = setsockopt(ins->fd, SOL_SOCKET, SO_SELECT_ERR_QUEUE, &enabled,
                     sizeof(enabled))) < 0) {
         perror("SO_SELECT_ERR_QUEUE");
         return res;
     }
-    if ((res = setsockopt(fd, IPPROTO_IP, IP_PKTINFO, &enabled, 
-                    sizeof(enabled))) < 0) {
-        perror("IP_PKTINFO");
-        return res;
+    if (ins->family == AF_INET) {
+        if ((res = setsockopt(ins->fd, IPPROTO_IP, IP_PKTINFO, &enabled,
+                        sizeof(enabled))) < 0) {
+            perror("IP_PKTINFO");
+            return res;
+        }
+    } else {
+        if ((res = setsockopt(ins->fd, IPPROTO_IPV6, IPV6_RECVPKTINFO, &enabled,
+                        sizeof(enabled))) < 0) {
+            perror("IPV6_RECVPKTINFO");
+            return res;
+        }
     }
 
     return 0;
 }
 
 static inline ssize_t send_pkt_common(struct nanoping_instance *ins,
-        struct sockaddr_in *remaddr, struct iovec *iov, uint64_t seq)
+        struct sockaddr_storage *remaddr, socklen_t remaddr_len,
+        struct iovec *iov, uint64_t seq)
 {
     struct msghdr m = {0};
     ssize_t siz;
     int res;
 
     m.msg_name = remaddr;
-    m.msg_namelen = sizeof(struct sockaddr_in);
+    m.msg_namelen = remaddr_len;
     m.msg_iov = iov;
     m.msg_iovlen = 1;
 
@@ -182,7 +215,8 @@ static inline ssize_t send_pkt_common(struct nanoping_instance *ins,
 }
 
 static inline ssize_t send_pkt_ptp(struct nanoping_instance *ins,
-        struct sockaddr_in *remaddr, uint64_t seq, struct timespec *prev_rxs,
+        struct sockaddr_storage *remaddr, socklen_t remaddr_len,
+        uint64_t seq, struct timespec *prev_rxs,
         struct nanoping_msg_txs_record *txs_rec, int txs_rec_len,
         enum nanoping_msg_type type)
 {
@@ -197,10 +231,11 @@ static inline ssize_t send_pkt_ptp(struct nanoping_instance *ins,
     for (int i = 0; i < txs_rec_len; i++)
         ptp.msg.txs_rec[i] = txs_rec[i];
 
-    return send_pkt_common(ins, remaddr, &iov, seq);
+    return send_pkt_common(ins, remaddr, remaddr_len, &iov, seq);
 }
 
-static inline ssize_t send_pkt_msg(struct nanoping_instance *ins, struct sockaddr_in *remaddr,
+static inline ssize_t send_pkt_msg(struct nanoping_instance *ins,
+        struct sockaddr_storage *remaddr, socklen_t remaddr_len,
         uint64_t seq, struct timespec *prev_rxs,
         struct nanoping_msg_txs_record *txs_rec, int txs_rec_len,
         enum nanoping_msg_type type)
@@ -215,18 +250,19 @@ static inline ssize_t send_pkt_msg(struct nanoping_instance *ins, struct sockadd
     for (int i = 0; i < txs_rec_len; i++)
         msg.txs_rec[i] = txs_rec[i];
 
-    return send_pkt_common(ins, remaddr, &iov, seq);
+    return send_pkt_common(ins, remaddr, remaddr_len, &iov, seq);
 }
 
-static ssize_t send_pkt(struct nanoping_instance *ins, struct sockaddr_in *remaddr,
+static ssize_t send_pkt(struct nanoping_instance *ins,
+        struct sockaddr_storage *remaddr, socklen_t remaddr_len,
         uint64_t seq, struct timespec *prev_rxs,
         struct nanoping_msg_txs_record *txs_rec, int txs_rec_len,
         enum nanoping_msg_type type)
 {
     if (!ins->ptpmode)
-        return send_pkt_msg(ins, remaddr, seq, prev_rxs, txs_rec, txs_rec_len, type);
+        return send_pkt_msg(ins, remaddr, remaddr_len, seq, prev_rxs, txs_rec, txs_rec_len, type);
     else
-        return send_pkt_ptp(ins, remaddr, seq, prev_rxs, txs_rec, txs_rec_len, type);
+        return send_pkt_ptp(ins, remaddr, remaddr_len, seq, prev_rxs, txs_rec, txs_rec_len, type);
 }
 
 static int parse_control_msg(struct msghdr *m, struct timespec *stamp,
@@ -269,6 +305,23 @@ static int parse_control_msg(struct msghdr *m, struct timespec *stamp,
                 return -1;
             }
             break;
+        case IPPROTO_IPV6:
+            switch (cm->cmsg_type) {
+            case IPV6_RECVERR:
+                exterr = (struct sock_extended_err *)CMSG_DATA(cm);
+                if (!(exterr->ee_errno == ENOMSG &&
+                        exterr->ee_origin == SO_EE_ORIGIN_TIMESTAMPING))
+                    fprintf(stderr, "Unexcepted recverr errno '%s' origin %d\n",
+                            strerror(exterr->ee_errno), exterr->ee_origin);
+                break;
+            case IPV6_PKTINFO:
+                break;
+            default:
+                fprintf(stderr, "Unexpected cmsg level:IPPROTO_IPV6 type:%d\n",
+                        cm->cmsg_type);
+                return -1;
+            }
+            break;
         default:
                 fprintf(stderr, "Unexpected cmsg level:%d type:%d\n",
                         cm->cmsg_level, cm->cmsg_type);
@@ -280,7 +333,8 @@ static int parse_control_msg(struct msghdr *m, struct timespec *stamp,
 
 static ssize_t receive_pkt_common(struct nanoping_instance *ins,
         struct iovec *iov, struct timespec *stamp,
-        struct sockaddr_in *remaddr, enum nanoping_receive_error *err)
+        struct sockaddr_storage *remaddr, socklen_t *remaddr_len,
+        enum nanoping_receive_error *err)
 {
     struct msghdr m = {0};
     char ctrlbuf[1024];
@@ -291,7 +345,7 @@ static ssize_t receive_pkt_common(struct nanoping_instance *ins,
     m.msg_iov = iov;
     m.msg_iovlen = 1;
     m.msg_name = remaddr;
-    m.msg_namelen = sizeof(struct sockaddr_in);
+    m.msg_namelen = sizeof(*remaddr);
     m.msg_control = ctrlbuf;
     m.msg_controllen = sizeof(ctrlbuf);
 
@@ -304,6 +358,8 @@ static ssize_t receive_pkt_common(struct nanoping_instance *ins,
         perror("recvmsg");
         return siz;
     }
+
+    *remaddr_len = m.msg_namelen;
 
     ins->pkt_received++;
     if (ins->emulation) {
@@ -329,11 +385,12 @@ static ssize_t receive_pkt_common(struct nanoping_instance *ins,
 
 static ssize_t receive_pkt_msg(struct nanoping_instance *ins,
         struct nanoping_msg *msg, struct timespec *stamp,
-        struct sockaddr_in *remaddr, enum nanoping_receive_error *err)
+        struct sockaddr_storage *remaddr, socklen_t *remaddr_len,
+        enum nanoping_receive_error *err)
 {
     struct iovec iov = {msg, sizeof(*msg)};
 
-    ssize_t siz = receive_pkt_common(ins, &iov, stamp, remaddr, err);
+    ssize_t siz = receive_pkt_common(ins, &iov, stamp, remaddr, remaddr_len, err);
 
     if (msg->seq > 1) {
         if (msg->rxs.tv_sec == 0 && msg->rxs.tv_nsec == 0)
@@ -351,11 +408,12 @@ static ssize_t receive_pkt_msg(struct nanoping_instance *ins,
 
 static ssize_t receive_pkt_ptp(struct nanoping_instance *ins,
         struct ptp_header *ptp, struct timespec *stamp,
-        struct sockaddr_in *remaddr, enum nanoping_receive_error *err)
+        struct sockaddr_storage *remaddr, socklen_t *remaddr_len,
+        enum nanoping_receive_error *err)
 {
     struct iovec iov = {ptp, sizeof(*ptp)};
 
-    ssize_t siz = receive_pkt_common(ins, &iov, stamp, remaddr, err);
+    ssize_t siz = receive_pkt_common(ins, &iov, stamp, remaddr, remaddr_len, err);
 
     if (ptp->msg.seq > 1) {
         if (ptp->msg.rxs.tv_sec == 0 && ptp->msg.rxs.tv_nsec == 0)
@@ -371,7 +429,7 @@ static ssize_t receive_pkt_ptp(struct nanoping_instance *ins,
     return siz;
 }
 
-struct nanoping_instance *nanoping_init(char *interface, char *port, bool server, bool emulation, bool ptpmode, int timeout, int busy_poll)
+struct nanoping_instance *nanoping_init(char *interface, char *address, char *port, int family, bool server, bool emulation, bool ptpmode, int timeout, int busy_poll)
 {
     struct nanoping_instance *ins =
         (struct nanoping_instance *)calloc(1, sizeof(*ins));
@@ -379,12 +437,15 @@ struct nanoping_instance *nanoping_init(char *interface, char *port, bool server
 
     assert(ins);
 
-    if ((ins->fd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
+    ins->family = family;
+    ins->myaddr_len = sockaddr_len(ins->family);
+
+    if ((ins->fd = socket(ins->family, SOCK_DGRAM, 0)) < 0) {
         perror("socket");
         return NULL;
     }
 
-    if ((ins->nots_fd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
+    if ((ins->nots_fd = socket(ins->family, SOCK_DGRAM, 0)) < 0) {
         perror("socket");
         return NULL;
     }
@@ -428,20 +489,31 @@ struct nanoping_instance *nanoping_init(char *interface, char *port, bool server
         }
     }
 
-    ins->myaddr.sin_family = AF_INET;
-    ins->myaddr.sin_port = htons(atoi(port));
-    if (get_if_address(ins->fd, interface, &ins->myaddr.sin_addr) < 0) {
-        perror("get_if_address");
-        return NULL;
+    if (!address) {
+        if (get_if_address(ins->fd, interface, ins->family, htons(atoi(port)), &ins->myaddr) < 0) {
+            perror("get_if_address");
+            return NULL;
+        }
+    } else {
+        struct addrinfo *ai;
+        if (getaddrinfo(address, port, NULL, &ai) < 0) {
+            perror("getaddrinfo");
+            return NULL;
+        }
+        assert(ins->myaddr_len == ai->ai_addrlen);
+        memcpy(&ins->myaddr, ai->ai_addr, ai->ai_addrlen);
+        freeaddrinfo(ai);
     }
 
     ins->server = server;
-    if (ptpmode || server) {
-        if (bind(ins->fd, (struct sockaddr *)&ins->myaddr, sizeof(ins->myaddr)) < 0) {
+    if (ptpmode || server || address) {
+        if (bind(ins->fd, (struct sockaddr *)&ins->myaddr, ins->myaddr_len) < 0) {
             perror("bind");
             return NULL;
         }
     }
+
+    ins->ptpmode = ptpmode;
 
     if (emulation) {
         ins->emulation = true;
@@ -451,10 +523,9 @@ struct nanoping_instance *nanoping_init(char *interface, char *port, bool server
         }
     }else{
         ins->emulation = false;
-        if (enable_hw_timestamp(ins->fd, interface, ptpmode) < 0)
+        if (enable_hw_timestamp(ins, interface) < 0)
             return NULL;
     }
-    ins->ptpmode = ptpmode;
 
     if (busy_poll) {
         if ((res = setsockopt(ins->fd, SOL_SOCKET, SO_BUSY_POLL, &busy_poll,
@@ -671,7 +742,7 @@ ssize_t nanoping_receive_one(struct nanoping_instance *ins,
     if (!ins->ptpmode) {
         struct nanoping_msg msg;
 
-        siz = receive_pkt_msg(ins, &msg, &stamp, &result->remaddr, &err);
+        siz = receive_pkt_msg(ins, &msg, &stamp, &result->remaddr, &result->remaddr_len, &err);
         if (siz < 0)
             return siz;
 
@@ -686,7 +757,7 @@ ssize_t nanoping_receive_one(struct nanoping_instance *ins,
     }else{
         struct ptp_header ptp;
 
-        siz = receive_pkt_ptp(ins, &ptp, &stamp, &result->remaddr, &err);
+        siz = receive_pkt_ptp(ins, &ptp, &stamp, &result->remaddr, &result->remaddr_len, &err);
         if (siz < 0)
             return siz;
 
@@ -756,13 +827,13 @@ ssize_t nanoping_send_one(struct nanoping_instance *ins,
             }
         }
     }
-    if ((siz = send_pkt(ins, &request->remaddr, request->seq, rxs, txs_rec, i, request->type)) < 0)
+    if ((siz = send_pkt(ins, &request->remaddr, request->remaddr_len, request->seq, rxs, txs_rec, i, request->type)) < 0)
         return siz;
     ins->pkt_transmitted++;
     return siz;
 }
 
-static int send_dummies_common(struct nanoping_instance *ins, struct sockaddr_in *remaddr, int nmsg, struct iovec *iovs)
+static int send_dummies_common(struct nanoping_instance *ins, struct sockaddr_storage *remaddr, socklen_t remaddr_len, int nmsg, struct iovec *iovs)
 {
     struct mmsghdr mmsgs[nmsg];
     int res;
@@ -770,7 +841,7 @@ static int send_dummies_common(struct nanoping_instance *ins, struct sockaddr_in
     memset(mmsgs, 0, sizeof(mmsgs));
     for (int i = 0; i < nmsg; i++) {
         mmsgs[i].msg_hdr.msg_name = remaddr;
-        mmsgs[i].msg_hdr.msg_namelen = sizeof(struct sockaddr_in);
+        mmsgs[i].msg_hdr.msg_namelen = remaddr_len;
         mmsgs[i].msg_hdr.msg_iov = &iovs[i];
         mmsgs[i].msg_hdr.msg_iovlen = 1;
     }
@@ -785,7 +856,7 @@ static int send_dummies_common(struct nanoping_instance *ins, struct sockaddr_in
     return res;
 }
 
-static int send_dummies_msg(struct nanoping_instance *ins, struct sockaddr_in *remaddr, int nmsg)
+static int send_dummies_msg(struct nanoping_instance *ins, struct sockaddr_storage *remaddr, socklen_t remaddr_len, int nmsg)
 {
     struct nanoping_msg msgs[nmsg];
     struct iovec iovs[nmsg];
@@ -798,10 +869,10 @@ static int send_dummies_msg(struct nanoping_instance *ins, struct sockaddr_in *r
         iovs[i].iov_base = &msgs[i];
         iovs[i].iov_len = sizeof(struct nanoping_msg);
     }
-    return send_dummies_common(ins, remaddr, nmsg, iovs);
+    return send_dummies_common(ins, remaddr, remaddr_len, nmsg, iovs);
 }
 
-static int send_dummies_ptp(struct nanoping_instance *ins, struct sockaddr_in *remaddr, int nmsg)
+static int send_dummies_ptp(struct nanoping_instance *ins, struct sockaddr_storage *remaddr, socklen_t remaddr_len, int nmsg)
 {
     struct ptp_header msgs[nmsg];
     struct iovec iovs[nmsg];
@@ -817,7 +888,7 @@ static int send_dummies_ptp(struct nanoping_instance *ins, struct sockaddr_in *r
         iovs[i].iov_base = &msgs[i];
         iovs[i].iov_len = sizeof(struct nanoping_msg);
     }
-    return send_dummies_common(ins, remaddr, nmsg, iovs);
+    return send_dummies_common(ins, remaddr, remaddr_len, nmsg, iovs);
 }
 
 int nanoping_send_dummies(struct nanoping_instance *ins, struct nanoping_send_dummies_request *request)
@@ -825,9 +896,9 @@ int nanoping_send_dummies(struct nanoping_instance *ins, struct nanoping_send_du
     assert(ins && request);
 
     if (!ins->ptpmode)
-        return send_dummies_msg(ins, &request->remaddr, request->nmsg);
+        return send_dummies_msg(ins, &request->remaddr, request->remaddr_len, request->nmsg);
     else
-        return send_dummies_ptp(ins, &request->remaddr, request->nmsg);
+        return send_dummies_ptp(ins, &request->remaddr, request->remaddr_len, request->nmsg);
 }
 
 static int append_txs_rec(struct nanoping_instance *ins, uint64_t seq, struct timespec stamp)
@@ -871,7 +942,7 @@ static int append_txs_rec(struct nanoping_instance *ins, uint64_t seq, struct ti
 int nanoping_txs_one(struct nanoping_instance *ins)
 {
     fd_set exceptfds;
-    struct sockaddr_in remaddr;
+    struct sockaddr_storage remaddr;
     struct msghdr m = {0};
     char pktbuf[2048];
     char ctrlbuf[1024];

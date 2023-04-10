@@ -13,6 +13,8 @@ struct nanoping_timeval {
 
 #define logprintf(log, ...) if (log) { fprintf(log, __VA_ARGS__); fflush(log); }
 
+#define sockaddr_len(family) (((family) == AF_INET) ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6))
+
 #define timevaladd(tvp, uvp, vvp) \
     do { \
         (vvp)->tv_sec = (tvp)->tv_sec + (uvp)->tv_sec; \
@@ -50,7 +52,9 @@ TAILQ_HEAD(nanoping_txs_record_head, nanoping_txs_record);
 struct nanoping_instance {
     int fd;
     int nots_fd;
-    struct sockaddr_in myaddr;
+    int family;
+    struct sockaddr_storage myaddr;
+    socklen_t myaddr_len;
     struct nanoping_rx_record_head rx_head;
     struct nanoping_rx_record_head rx4proc_head;
     struct nanoping_rx_record_head rx4tx_head;
@@ -96,11 +100,13 @@ enum nanoping_msg_type {
 struct nanoping_send_request {
     enum nanoping_msg_type type;
     uint64_t seq;
-    struct sockaddr_in remaddr;
+    struct sockaddr_storage remaddr;
+    socklen_t remaddr_len;
 };
 
 struct nanoping_send_dummies_request {
-    struct sockaddr_in remaddr;
+    struct sockaddr_storage remaddr;
+    socklen_t remaddr_len;
     int nmsg;
 };
 
@@ -116,7 +122,8 @@ enum nanoping_receive_error {
 struct nanoping_receive_result {
     enum nanoping_msg_type type;
     uint64_t seq;
-    struct sockaddr_in remaddr;
+    struct sockaddr_storage remaddr;
+    socklen_t remaddr_len;
 };
 
 struct nanoping_process_result {
@@ -127,7 +134,7 @@ struct nanoping_process_result {
 };
 
 
-struct nanoping_instance *nanoping_init(char *interface, char *port, bool server, bool emulation, bool ptpmode, int timeout, int busy_poll);
+struct nanoping_instance *nanoping_init(char *interface, char *address, char *port, int family, bool server, bool emulation, bool ptpmode, int timeout, int busy_poll);
 int nanoping_process_one(struct nanoping_instance *ins,
     struct nanoping_process_result *result);
 int nanoping_wait_for_receive(struct nanoping_instance *ins);
