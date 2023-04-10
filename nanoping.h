@@ -67,6 +67,7 @@ struct nanoping_instance {
     pthread_mutex_t txs_lock;
     pthread_mutex_t txs4proc_lock;
     pthread_mutex_t rem_txs_lock;
+    bool softts;
     bool server;
     bool emulation;
     bool ptpmode;
@@ -134,7 +135,7 @@ struct nanoping_process_result {
 };
 
 
-struct nanoping_instance *nanoping_init(char *interface, char *address, char *port, int family, bool server, bool emulation, bool ptpmode, int timeout, int busy_poll);
+struct nanoping_instance *nanoping_init(char *interface, char *address, char *port, int family, bool softts, bool server, bool emulation, bool ptpmode, int timeout, int busy_poll);
 int nanoping_process_one(struct nanoping_instance *ins,
     struct nanoping_process_result *result);
 int nanoping_wait_for_receive(struct nanoping_instance *ins);

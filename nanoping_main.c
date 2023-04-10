@@ -28,6 +28,7 @@ static struct option longopts[] = {
     {"port",    required_argument,  NULL,  'p'},
     {"log",     required_argument,  NULL,   'l'},
     {"ipv6",    no_argument,        NULL,   '6'},
+    {"softts",  no_argument,        NULL,   'S'},
     {"emulation",   no_argument,    NULL,   'e'},
     {"ptpmode", no_argument,        NULL,   'P'},
     {"silent",  no_argument,        NULL,   's'},
@@ -47,8 +48,8 @@ static pthread_t signal_thread = 0;
 static void usage(void)
 {
     fprintf(stderr, "usage:\n");
-    fprintf(stderr, "  client: nanoping --client --interface [nic] --address [ip] --count [sec] --delay [usec] --port [port] --log [log] --ipv6 --emulation --ptpmode --silent --timeout [usec] --busypoll [usec] --dummy-pkt [cnt] [host]\n");
-    fprintf(stderr, "  server: nanoping --server --interface [nic] --address [ip] --port [port] --ipv6 --emulation --ptpmode --silent --timeout [usec] --busypoll [usec] --dummy-pkt [cnt]\n");
+    fprintf(stderr, "  client: nanoping --client --interface [nic] --address [ip] --count [sec] --delay [usec] --port [port] --log [log] --ipv6 --softts --emulation --ptpmode --silent --timeout [usec] --busypoll [usec] --dummy-pkt [cnt] [host]\n");
+    fprintf(stderr, "  server: nanoping --server --interface [nic] --address [ip] --port [port] --ipv6 --softts --emulation --ptpmode --silent --timeout [usec] --busypoll [usec] --dummy-pkt [cnt]\n");
 }
 
 static struct {
@@ -643,6 +644,7 @@ int main(int argc, char **argv)
     char *port = "10666";
     char *log = NULL;
     int family = AF_INET;
+    bool softts = false;
     bool emulation = false;
     bool ptpmode = false;
     bool silent = false;
@@ -666,7 +668,7 @@ int main(int argc, char **argv)
 	usage();
 	return EXIT_FAILURE;
     }
-    while ((c = getopt_long(nargc, argv + 1, "i:a:n:d:p:l:6ePst:b:h", longopts, NULL)) != -1) {
+    while ((c = getopt_long(nargc, argv + 1, "i:a:n:d:p:l:6SePst:b:h", longopts, NULL)) != -1) {
         switch (c) {
             case 'i':
                 interface = optarg;
@@ -688,6 +690,9 @@ int main(int argc, char **argv)
                 break;
             case '6':
                 family = AF_INET6;
+                break;
+            case 'S':
+                softts = true;
                 break;
             case 'e':
                 emulation = true;
@@ -730,7 +735,7 @@ int main(int argc, char **argv)
      }
 
     pthread_mutex_init(&stats.lock, NULL);
-    if ((ins = nanoping_init(interface, address, port, family, mode == mode_server ? true: false, emulation, ptpmode, timeout, busy_poll)) == NULL) {
+    if ((ins = nanoping_init(interface, address, port, family, softts, mode == mode_server ? true: false, emulation, ptpmode, timeout, busy_poll)) == NULL) {
         return EXIT_FAILURE;
     }
 

@@ -106,7 +106,7 @@ static int get_if_address(int fd, char *ifname, int family, uint16_t port, struc
     return ret;
 }
 
-static int enable_hw_timestamp(struct nanoping_instance *ins, char *ifname)
+static int enable_timestamping(struct nanoping_instance *ins, char *ifname)
 {
     int res;
     struct hwtstamp_config config = {.flags = 0, .tx_type = HWTSTAMP_TX_ON};
@@ -124,7 +124,8 @@ static int enable_hw_timestamp(struct nanoping_instance *ins, char *ifname)
     ifr.ifr_data = (void *)&config;
     if ((res = ioctl(ins->fd, SIOCSHWTSTAMP, &ifr)) < 0) {
         perror("SIOCSHWTSTAMP");
-        return res;
+        if (!ins->softts)
+            return res;
     }
     if (!config.tx_type) {
         fprintf(stderr, "HW TX timestamp doesn't supported on this NIC\n");
@@ -137,7 +138,12 @@ static int enable_hw_timestamp(struct nanoping_instance *ins, char *ifname)
     opt = SOF_TIMESTAMPING_RX_HARDWARE |
         SOF_TIMESTAMPING_TX_HARDWARE |
         SOF_TIMESTAMPING_RAW_HARDWARE |
+        SOF_TIMESTAMPING_RX_SOFTWARE |
+        SOF_TIMESTAMPING_TX_SOFTWARE |
+        SOF_TIMESTAMPING_SOFTWARE |
         SOF_TIMESTAMPING_OPT_CMSG;
+    if (ins->softts)
+        opt |= SOF_TIMESTAMPING_TX_SCHED;
     if ((res = setsockopt(ins->fd, SOL_SOCKET, SO_TIMESTAMPING, (char *)&opt,
                     sizeof(opt))) < 0) {
         perror("SO_TIMESTAMPING");
@@ -265,8 +271,8 @@ static ssize_t send_pkt(struct nanoping_instance *ins,
         return send_pkt_ptp(ins, remaddr, remaddr_len, seq, prev_rxs, txs_rec, txs_rec_len, type);
 }
 
-static int parse_control_msg(struct msghdr *m, struct timespec *stamp,
-        int *stamp_found)
+static int parse_control_msg(struct msghdr *m, bool softts,
+        struct timespec *stamp, int *stamp_found)
 {
     struct cmsghdr *cm;
     struct timespec *received_stamp;
@@ -279,7 +285,7 @@ static int parse_control_msg(struct msghdr *m, struct timespec *stamp,
             switch (cm->cmsg_type) {
             case SO_TIMESTAMPING:
                 received_stamp = (struct timespec *)CMSG_DATA(cm);
-                *stamp = received_stamp[2];
+                *stamp = received_stamp[softts ? 0 : 2];
                 *stamp_found = 1;
                 break;
             default:
@@ -370,7 +376,7 @@ static ssize_t receive_pkt_common(struct nanoping_instance *ins,
         stamp_found = 1;
     }else{
         /* on RX side, control message comes with data */
-        if ((res = parse_control_msg(&m, stamp, &stamp_found)) < 0)
+        if ((res = parse_control_msg(&m, ins->softts, stamp, &stamp_found)) < 0)
             return res;
     }
 
@@ -429,7 +435,7 @@ static ssize_t receive_pkt_ptp(struct nanoping_instance *ins,
     return siz;
 }
 
-struct nanoping_instance *nanoping_init(char *interface, char *address, char *port, int family, bool server, bool emulation, bool ptpmode, int timeout, int busy_poll)
+struct nanoping_instance *nanoping_init(char *interface, char *address, char *port, int family, bool softts, bool server, bool emulation, bool ptpmode, int timeout, int busy_poll)
 {
     struct nanoping_instance *ins =
         (struct nanoping_instance *)calloc(1, sizeof(*ins));
@@ -439,6 +445,7 @@ struct nanoping_instance *nanoping_init(char *interface, char *address, char *po
 
     ins->family = family;
     ins->myaddr_len = sockaddr_len(ins->family);
+    ins->softts = softts;
 
     if ((ins->fd = socket(ins->family, SOCK_DGRAM, 0)) < 0) {
         perror("socket");
@@ -523,7 +530,7 @@ struct nanoping_instance *nanoping_init(char *interface, char *address, char *po
         }
     }else{
         ins->emulation = false;
-        if (enable_hw_timestamp(ins, interface) < 0)
+        if (enable_timestamping(ins, interface) < 0)
             return NULL;
     }
 
@@ -1004,7 +1011,7 @@ int nanoping_txs_one(struct nanoping_instance *ins)
     headsiz = siz - sizeof(*msg);
     msg = (struct nanoping_msg *)(((char *)pktbuf) + headsiz);
 
-    if ((res = parse_control_msg(&m, &stamp, &stamp_found)) < 0)
+    if ((res = parse_control_msg(&m, ins->softts, &stamp, &stamp_found)) < 0)
         return res;
 
     if (stamp_found) {
